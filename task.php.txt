@@ -1,0 +1,146 @@
+<?php
+
+$login      = "admin";
+$password   = "ZPzME";
+
+$domain     = 'http:///';
+$redirect   = "wp-admin/admin.php?page=wwcEbyAff_insane_import";
+
+$admin_ajax = 'wp-admin/admin-ajax.php';
+
+$log_file = __DIR__.'/log/cron-'.date('Y_m_d_H_i_s').'.txt';
+$asins_file = 'asins.txt';
+
+$page_size  = 20;
+$num_pages  = 0; 
+$page       = array();
+
+function get_operation_id() {
+   return round(microtime(true) * 1000);
+}
+
+function write_log($text, $verbose=true) {
+   global $log_file;
+   $line = date('H:i:s').' - '.$text."\n";
+   if ($verbose) print $line;
+   return file_put_contents($log_file, $line, FILE_APPEND);
+}
+
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $domain.'/wp-login.php');
+curl_setopt($ch, CURLOPT_POSTFIELDS,'log='.urlencode($login).'&pwd='.urlencode($password).'&redirect_to='.urlencode($redirect));
+curl_setopt($ch, CURLOPT_POST, 1);
+curl_setopt($ch, CURLOPT_HEADER, 0);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+curl_setopt($ch, CURLOPT_COOKIEJAR, "cookies.txt");
+curl_setopt($ch, CURLOPT_COOKIEFILE, "cookies.txt");
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+curl_setopt($ch, CURLOPT_USERAGENT, "Wooebay Client");
+$result = curl_exec($ch);
+
+// Check if login failed
+if (!preg_match('/You are about to permanently delete these items/Usi', $result)) {
+   write_log('Wordpress authentication failed.');
+   exit();
+}
+
+write_log('Wordpress authenticated with user "'.$login.'"');
+
+$asins = array();
+
+// Load assins and chunk into pages of 20
+
+$fp = fopen($asins_file, 'r');
+while(($asin = fgets($fp)) !== FALSE) {
+   if (preg_match('~^http://.+/(?P<ASIN>[0-9]{12})~Usi', $asin, $m)) {
+      $asin = $m['ASIN'];
+   }
+   $asins[] = $asin;
+}
+fclose($fp);
+$page = array_chunk($asins, $page_size);
+
+if (($num_asins = count($asins)) === 0) {
+   write_log('Exiting...Did not find any ASINs in text file.');
+   exit();
+}
+
+$num_pages = intval(ceil($num_asins / $page_size));
+
+// Loop through each page of loaded asins - $j = current page number
+
+write_log(sprintf('Total pages %d', $num_pages));
+write_log('Beginning import...');
+
+for ($p=0; $p<$num_pages; $p++):
+   write_log(sprintf('Processing page %d', $p+1));
+   $asins = $page[$p];
+   $post_vars = array(
+         'action'=>'wwcEbyAffIM_LoadProdsByASIN',
+         'asins'=>$asins,
+         'debug_level'=>0,
+         'operation'=>'bulk',
+         'operation_id'=>get_operation_id(),
+         'page'=>1,
+         'provider'=>'ebay'
+   );
+
+   curl_setopt($ch, CURLOPT_URL, $domain.$admin_ajax);
+   curl_setopt($ch, CURLOPT_POSTFIELDS,  $query = http_build_query($post_vars));
+   curl_setopt($ch, CURLOPT_POST,  1);
+
+   $result = curl_exec($ch);
+   $obj = json_decode($result);
+   write_log(sprintf('Found %d ASINs on page %d', count($obj->asins->loaded), $p+1));
+   
+   foreach ($obj->asins->loaded as $k=>$asin) {
+      write_log(sprintf('Processing ASIN: %s', $asin));
+      $post_vars = array(
+         'action'=>'wwcEbyAffIM_ImportProduct',
+         'asin'=>$asin,
+         'debug_level'=>0,
+         'operation_id'=>get_operation_id(),
+         'params'=>'import_type=default&nbimages=all&nbvariations=5&attributes=added&to-category=-1',
+         'provider'=>'ebay'
+      );
+      curl_setopt($ch, CURLOPT_URL, $domain.$admin_ajax);
+      curl_setopt($ch, CURLOPT_POSTFIELDS,  $query = http_build_query($post_vars));
+      curl_setopt($ch, CURLOPT_POST,  1);
+      $result = curl_exec($ch);
+      $ret = json_decode($result);
+
+      // If import successful than fetch all asset IDs for item and download one by one
+      if ($ret->status == 'valid') {
+         $html = $ret->download_lightbox_html;
+         preg_match_all('~<li.*data\-id="(?P<ID>[^"]+)">~Usi', $html, $assets, PREG_SET_ORDER);
+
+         $total_assets = count($assets);
+
+         for($i=0; $i<$total_assets; $i++) {
+            $asset = $assets[$i];
+            $asset_id = $asset['ID'];
+            $post_vars1 = array(
+              'action' => 'wwcEbyAff_download_asset',
+              'debug_level' => 0,
+              'id'=>$asset_id,
+              'is_first_item'=>($i==0?'yes':'no'),
+              'is_last_item'=>($i==$total_assets-1?'yes':'no')
+            );
+            curl_setopt($ch, CURLOPT_URL, $domain.$admin_ajax);
+            curl_setopt($ch, CURLOPT_POSTFIELDS,  $query = http_build_query($post_vars1));
+            curl_setopt($ch, CURLOPT_POST,  1);
+            $starttime = microtime(TRUE);
+            $result1 = curl_exec($ch);
+            $result1 = preg_replace('~<code>{execution_time}</code>~Usi', (microtime(TRUE) - $starttime), $result1);
+            $ret1 = json_decode($result1);
+            write_log('Asset Download (Status: '.$ret1->status.', Message: '.$ret1->msg.')');
+         }
+      } else {
+         write_log('Product already imported or invalid ASIN '.$asin.'.');
+      }
+   }
+
+endfor;
+
+write_log('Program ended');
